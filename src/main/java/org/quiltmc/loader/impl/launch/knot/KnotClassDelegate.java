@@ -104,10 +104,9 @@ class KnotClassDelegate {
 	private final Map<String, String[]> allowedPrefixes = new ConcurrentHashMap<>();
 	private final Set<String> parentSourcedClasses = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
-	private final Map<String, KnotSeparateClassLoader> modClassLoaders = new ConcurrentHashMap<>();
-
-	/** Classes loaded by this loader, or {@link KnotSeparateClassLoader}. */
-	private final Map<String, Class<?>> classes = new ConcurrentHashMap<>();
+	/** Set of {@link URL}s which should not be loaded from the parent, because they have been replaced by URLs/paths
+	 * in this loader. */
+	private final Set<String> parentHiddenUrls = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
 	/** Map of package to whether we can load it in this environment. */
 	private final Map<String, Boolean> packageSideCache = new ConcurrentHashMap<>();
@@ -146,15 +145,15 @@ class KnotClassDelegate {
 		return mixinTransformer;
 	}
 
-	Class<?> loadClass(String name, ClassLoader parent, KnotSeparateClassLoader from, boolean resolve) throws ClassNotFoundException {
-		Class<?> c = loadClassOnly(name, parent, from);
+	Class<?> loadClass(String name, ClassLoader parent, boolean resolve) throws ClassNotFoundException {
+		Class<?> c = loadClassOnly(name, parent);
 		if (resolve) {
 			itf.resolveClassFwd(c);
 		}
 		return c;
 	}
 
-	private Class<?> loadClassOnly(String name, ClassLoader parent, KnotSeparateClassLoader from) throws ClassNotFoundException {
+	private Class<?> loadClassOnly(String name, ClassLoader parent) throws ClassNotFoundException {
 		Class<?> c = itf.findLoadedClassFwd(name);
 		if (c != null) {
 			return c;
@@ -175,92 +174,12 @@ class KnotClassDelegate {
 			return c;
 		}
 
-		c = parent.loadClass(name);
-
-		if (c != null && from != null) {
-			QuiltLoaderInternal internal = c.getAnnotation(QuiltLoaderInternal.class);
-			QuiltLoaderInternalType type;
-			Class<?>[] replacements = {};
-			if (internal != null) {
-				type = internal.value();
-				replacements = internal.replacements();
-			} else if (name.startsWith("org.quiltmc.loader.impl")) {
-				type = QuiltLoaderInternalType.LEGACY_EXPOSED;
-				Log.warn(LogCategory.GENERAL, c + " isn't annotated with @QuiltLoaderInternal!");
-			} else if (name.startsWith("org.quiltmc.loader.api.plugin")) {
-				type = QuiltLoaderInternalType.PLUGIN_API;
-				Log.warn(LogCategory.GENERAL, c + " isn't annotated with @QuiltLoaderInternal!");
-			} else {
-				return c;
-			}
-
-			if (type != QuiltLoaderInternalType.LEGACY_NO_WARN) {
-				String src = from.key().toString();
-				String msg = generateInternalClassWarning(c, type, replacements, src);
-
-				switch (type) {
-					case LEGACY_EXPOSED: {
-						// TODO: Disable this when we can generate a report with this information!
-						Log.warn(LogCategory.GENERAL, msg, new Throwable());
-						break;
-					}
-					case NEW_INTERNAL:
-					case PLUGIN_API:
-					default: {
-						throw new IllegalQuiltInternalAccessError(msg);
-					}
-				}
-			}
-		}
-
-		return c;
-	}
-
-	private static String generateInternalClassWarning(Class<?> target, QuiltLoaderInternalType type, Class<?>[] replacements, String from) {
-		StringBuilder sb = new StringBuilder();
-		switch (type) {
-			case LEGACY_EXPOSED: {
-				sb.append("Found access to quilt-loader internal " + target + " by " + from + " - ");
-				break;
-			}
-			case NEW_INTERNAL: {
-				sb.append("! Quilt-loader internal " + target + " by " + from + "\n");
-				break;
-			}
-			case PLUGIN_API: {
-				sb.append("! Quilt-loader plugin-only internal api " + target + " by " + from + "\n");
-				break;
-			}
-			default: {
-				sb.append("! UNKNOWN TYPE " + type + "\n");
-				break;
-			}
-		}
-
-		if (replacements.length == 0) {
-			sb.append("Please don't use this, instead ask us to declare a new public API that we can guarantee backwards compatibility for!");
-
-			return sb.toString();
-		} else if (replacements.length == 1) {
-			sb.append("Please don't use this, instead try using the public api " + replacements[0] + " instead - that way we can guarantee backwards compatibility when using it!");
-		} else {
-			sb.append("Please don't use this, instead try one of the following public api classes since those have guaranteed backwards compatibility:");
-			for (Class<?> repl : replacements) {
-				sb.append("\n - " + repl);
-			}
-		}
-
-		return sb.toString();
+		return parent.loadClass(name);
 	}
 
 	Class<?> tryLoadClass(String name, boolean allowFromParent) throws ClassNotFoundException {
 		if (name.startsWith("java.")) {
 			return null;
-		}
-
-		Class<?> c = classes.get(name);
-		if (c != null) {
-			return c;
 		}
 
 		if (!allowFromParent && !parentSourcedClasses.isEmpty()) {
@@ -275,6 +194,31 @@ class KnotClassDelegate {
 		}
 
 		CachedUrl cachedUrl = new CachedUrl(name, allowFromParent);
+
+		if (!allowFromParent && name.startsWith("org.slf4j.")) {
+			// Force slf4j itself to be loaded on a single classloader
+			// FIXME DISABLED
+			// TODO: Change this into a report, rather than being printed on each overlap.
+			// Check to see if the class actually exists in the parent
+			// and it hasn't been "hidden"
+			String classFileName = LoaderUtil.getClassFileName(name);
+			URL originalURL = itf.getOriginalLoader().getResource(classFileName);
+			if (originalURL != null) {
+				try {
+					URL codeSource = UrlUtil.getSource(classFileName, originalURL);
+					if (codeSource != null && !parentHiddenUrls.contains(codeSource.toString())) {
+						// Exists in parent, not hidden
+						URL alsoInMods = cachedUrl.get();
+						if (alsoInMods != null) {
+							Log.warn(LogCategory.GENERAL, "Rerouting classloading to the parent classloader instead of " + alsoInMods);
+						}
+						return null;
+					}
+				} catch (UrlConversionException e) {
+					Log.warn(LogCategory.GENERAL, "Failed to get the code source URL for " + originalURL);
+				}
+			}
+		}
 
 		if (!allowedPrefixes.isEmpty()) {
 			URL url = cachedUrl.get();
@@ -309,53 +253,23 @@ class KnotClassDelegate {
 
 		int pkgDelimiterPos = name.lastIndexOf('.');
 
-		KnotBaseClassLoader cl = itf;
 		final String modId;
 
 		if (metadata.codeSource == null) {
 			modId = null;
-			URL url = cachedUrl.get();
-			// Inner classes generally should be associated with a mod if it's an inner class of an already loaded outer class
-			for (int i = name.indexOf("$"); i > 0 && i < name.length(); i = name.indexOf("$", i + 1)) {
-				String outer = name.substring(0, i);
-				Class<?> previousClass = classes.get(outer);
-				if (previousClass != null) {
-					cl = (KnotBaseClassLoader) previousClass.getClassLoader();
-					break;
-				}
-			}
-
-			if (url == null) {
-				// Then it's okay, since it will have been generated by something like mixin at runtime
-				if (cl == itf) {
-					cl = getClassLoader("!Generated!");
-				}
-			} else {
-				// Then it's less okay
-				// We don't have a code source for the URL - it was likely added by a mod calling "addUrl" directly.
-				if (cl == itf) {
-					cl = getClassLoader("?unknown?");
-				} else {
-					// A mod just snuck in, potentially avoiding package-access checks or @ModInternal checks
-					// Maybe in the future we'll warn about it... but for now we'll leave it alone
-				}
-			}
 		} else {
 			modId = metadata.codeSource.modId;
-			if (modId != null) {
-				boolean useOriginal = false;
+		}
 
-				GameProvider gameProvider = QuiltLoaderImpl.INSTANCE.getGameProvider();
-				if (modId.equals(gameProvider.getGameId())) {
-					if (!gameProvider.isGameClass(name)) {
-						useOriginal = true;
-					}
-				}
+		Class<?> c = itf.findLoadedClassFwd(name);
 
-				if (!useOriginal) {
-					cl = getClassLoader(modId);
-				}
-			}
+		if (c != null) {
+			// Workaround for an issue where the act of loading a class causes it to be loaded by the parent classloader,
+			// or where it causes a re-entrant classloading of itself
+			Log.warn(LogCategory.GENERAL, "Tried to define " + c + " but it was already loaded!");
+			Log.warn(LogCategory.GENERAL, "  - Already loaded source: " + UrlUtil.getCodeSource(c));
+			Log.warn(LogCategory.GENERAL, "  - Rejected (new) source: " + cachedUrl.get());
+			return c;
 		}
 
 		if (pkgDelimiterPos > 0) {
@@ -371,20 +285,19 @@ class KnotClassDelegate {
 				throw new RuntimeException("Cannot load package " + pkgString + " in environment type " + envType);
 			}
 
-			Package pkg = cl.getPackage(pkgString);
+			Package pkg = itf.getPackage(pkgString);
 
 			if (pkg == null) {
 				try {
-					pkg = cl.definePackage(pkgString, null, null, null, null, null, null, null);
+					pkg = itf.definePackage(pkgString, null, null, null, null, null, null, null);
 				} catch (IllegalArgumentException e) { // presumably concurrent package definition
-					pkg = cl.getPackage(pkgString);
+					pkg = itf.getPackage(pkgString);
 					if (pkg == null) throw e; // still not defined?
 				}
 			}
 		}
 
-		c = cl.defineClassFwd(name, input, 0, input.length, metadata.codeSource);
-		classes.put(name, c);
+		c = itf.defineClassFwd(name, input, 0, input.length, metadata.codeSource);
 
 		if (Boolean.getBoolean(SystemProperties.DEBUG_CLASS_TO_MOD)) {
 			StringBuilder text = new StringBuilder(name);
@@ -395,23 +308,10 @@ class KnotClassDelegate {
 			while (text.length() < 140) {
 				text.append(" ");
 			}
-			if (cl instanceof KnotSeparateClassLoader) {
-				text.append("KnotClassLoader.Separate[");
-				text.append(((KnotSeparateClassLoader) cl).key());
-				text.append("]");
-			} else {
-				text.append("KnotClassLoader");
-			}
 			text.append("\n");
 			System.out.print(text.toString());
 		}
 		return c;
-	}
-
-	KnotBaseClassLoader getClassLoader(String modId) {
-		return modClassLoaders.computeIfAbsent(modId, m -> {
-			return itf.createSeparateClassLoader(new ModClassLoaderKey(modId));
-		});
 	}
 
 	boolean computeCanLoadPackage(String pkgName, boolean allowFromParent) {
@@ -634,6 +534,10 @@ class KnotClassDelegate {
 		transformCacheUrl = insideTransformCache.toString();
 	}
 
+	void hideParentUrl(URL parentPath) {
+		parentHiddenUrls.add(parentPath.toString());
+	}
+
 	@QuiltLoaderInternal(QuiltLoaderInternalType.NEW_INTERNAL)
 	private final class CachedUrl {
 		final String className;
@@ -657,21 +561,6 @@ class KnotClassDelegate {
 		InputStream openStream() throws IOException {
 			URL u = get();
 			return u != null ? u.openStream() : null;
-		}
-	}
-
-	@QuiltLoaderInternal(QuiltLoaderInternalType.NEW_INTERNAL)
-	private static final class ModClassLoaderKey extends KnotClassLoaderKey {
-
-		final String modId;
-
-		public ModClassLoaderKey(String modId) {
-			this.modId = modId;
-		}
-
-		@Override
-		public String toString() {
-			return modId;
 		}
 	}
 }

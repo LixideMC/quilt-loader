@@ -283,6 +283,7 @@ public final class Knot extends QuiltLauncherBase {
 			URL url = UrlUtil.asUrl(path);
 			classLoader.getDelegate().setAllowedPrefixes(url, allowedPrefixes);
 			classLoader.addPath(path, mod, origin); // TODO: Create a method which passes the actual origin!
+			classLoader.getDelegate().hideParentUrl(url);
 		} catch (MalformedURLException e) {
 			throw new RuntimeException(e);
 		}
@@ -300,6 +301,20 @@ public final class Knot extends QuiltLauncherBase {
 	@Override
 	public void setTransformCache(URL insideTransformCache) {
 		classLoader.getDelegate().setTransformCache(insideTransformCache);
+	}
+
+	@Override
+	public void hideParentUrl(URL parent) {
+		classLoader.getDelegate().hideParentUrl(parent);
+	}
+
+	@Override
+	public void hideParentPath(Path obf) {
+		try {
+			classLoader.getDelegate().hideParentUrl(UrlUtil.asUrl(obf));
+		} catch (MalformedURLException e) {
+			Log.warn(LogCategory.GENERAL, "Unable to convert " + obf + " to a URL in Knot.hideParentPath");
+		}
 	}
 
 	@Override
@@ -338,9 +353,9 @@ public final class Knot extends QuiltLauncherBase {
 	}
 
 	private static boolean isMatchingClassLoader(ClassLoader expected, ClassLoader actual) {
-		if (actual instanceof KnotSeparateClassLoader) {
-			return ((KnotSeparateClassLoader) actual).getBaseClassLoader() == expected;
-		}
+//		if (actual instanceof KnotSeparateClassLoader) {
+//			return ((KnotSeparateClassLoader) actual).getBaseClassLoader() == expected;
+//		}
 		return expected == actual;
 	}
 
@@ -378,7 +393,7 @@ public final class Knot extends QuiltLauncherBase {
 		if (mod.getSourceType() == BasicSourceType.BUILTIN) {
 			return null;
 		}
-		return (ClassLoader) classLoader.getDelegate().getClassLoader(mod.metadata().id());
+		return getTargetClassLoader();
 	}
 
 	@Override

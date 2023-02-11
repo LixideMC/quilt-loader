@@ -22,40 +22,52 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.FileSystem;
-import java.nio.file.FileSystems;
+import java.nio.file.FileVisitOption;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.TreeMap;
 
 import org.quiltmc.loader.api.FasterFiles;
 import org.quiltmc.loader.api.plugin.solver.ModLoadOption;
 import org.quiltmc.loader.api.plugin.solver.ModSolveResult;
+import org.quiltmc.loader.impl.QuiltLoaderImpl;
 import org.quiltmc.loader.impl.discovery.ModResolutionException;
 import org.quiltmc.loader.impl.discovery.RuntimeModRemapper;
-import org.quiltmc.loader.impl.filesystem.QuiltMemoryFileStore.ReadWrite;
 import org.quiltmc.loader.impl.filesystem.PartiallyWrittenIOException;
 import org.quiltmc.loader.impl.filesystem.QuiltMemoryFileSystem;
 import org.quiltmc.loader.impl.filesystem.QuiltMemoryPath;
 import org.quiltmc.loader.impl.filesystem.QuiltZipFileSystem;
 import org.quiltmc.loader.impl.filesystem.QuiltZipPath;
+import org.quiltmc.loader.impl.util.FilePreloadHelper;
 import org.quiltmc.loader.impl.util.FileSystemUtil;
+import org.quiltmc.loader.impl.util.FileUtil;
 import org.quiltmc.loader.impl.util.HashUtil;
+import org.quiltmc.loader.impl.util.QuiltLoaderInternal;
+import org.quiltmc.loader.impl.util.QuiltLoaderInternalType;
 import org.quiltmc.loader.impl.util.SystemProperties;
 import org.quiltmc.loader.impl.util.log.Log;
 import org.quiltmc.loader.impl.util.log.LogCategory;
-import org.quiltmc.loader.impl.util.QuiltLoaderInternal;
-import org.quiltmc.loader.impl.util.QuiltLoaderInternalType;
 
 @QuiltLoaderInternal(QuiltLoaderInternalType.NEW_INTERNAL)
 public class TransformCache {
 
+	/** Sub-folder for classes which are not associated with any mod in particular, but still need to be classloaded. */
+	public static final String TRANSFORM_CACHE_NONMOD_CLASSLOADABLE = "Unknown Mod";
+
+	private static final String CACHE_FILE = "files.zip";
 	private static final String FILE_TRANSFORM_COMPLETE = "__TRANSFORM_COMPLETE";
 
-	public static QuiltZipPath populateTransformBundle(Path transformCacheFile, List<ModLoadOption> modList,
+	public static TransformCacheResult populateTransformBundle(Path transformCacheFolder, List<ModLoadOption> modList,
 		ModSolveResult result) throws ModResolutionException {
 		Map<String, String> map = new TreeMap<>();
 		// Mod order is important? For now, assume it is
@@ -77,18 +89,24 @@ public class TransformCache {
 			}
 		}
 
+		boolean enableChasm = Boolean.getBoolean(SystemProperties.ENABLE_EXPERIMENTAL_CHASM);
+		map.put("system-property:" + SystemProperties.ENABLE_EXPERIMENTAL_CHASM, "" + enableChasm);
+
 		try {
-			Files.createDirectories(transformCacheFile.getParent());
+			Files.createDirectories(transformCacheFolder.getParent());
 		} catch (IOException e) {
 			throw new ModResolutionException("Failed to create parent directories of the transform cache file!", e);
 		}
 
-		QuiltZipPath existing = checkTransformCache(transformCacheFile, map);
-		if (existing != null) {
-			return existing;
+		QuiltZipPath existing = checkTransformCache(transformCacheFolder, map);
+		boolean isNewlyGenerated = false;
+		if (existing == null) {
+			existing = createTransformCache(transformCacheFolder.resolve(CACHE_FILE), toString(map), modList, result);
+			isNewlyGenerated = true;
+		} else if (!Boolean.getBoolean(SystemProperties.DISABLE_PRELOAD_TRANSFORM_CACHE)) {
+			FilePreloadHelper.preLoad(transformCacheFolder.resolve(CACHE_FILE));
 		}
-
-		return createTransformCache(transformCacheFile, toString(map), modList, result);
+		return new TransformCacheResult(transformCacheFolder, isNewlyGenerated, existing);
 	}
 
 	private static String toString(Map<String, String> map) {
@@ -104,12 +122,17 @@ public class TransformCache {
 		return options;
 	}
 
-	private static QuiltZipPath checkTransformCache(Path transformCacheFile, Map<String, String> options) throws ModResolutionException {
-		if (!FasterFiles.exists(transformCacheFile)) {
+	private static QuiltZipPath checkTransformCache(Path transformCacheFolder, Map<String, String> options)
+		throws ModResolutionException {
+
+		Path cacheFile = transformCacheFolder.resolve(CACHE_FILE);
+
+		if (!FasterFiles.exists(cacheFile)) {
 			Log.info(LogCategory.CACHE, "Not reusing previous transform cache since it's missing");
+			erasePreviousTransformCache(transformCacheFolder, cacheFile, null);
 			return null;
 		}
-		try (QuiltZipFileSystem fs = new QuiltZipFileSystem("transform-cache", transformCacheFile, "")) {
+		try (QuiltZipFileSystem fs = new QuiltZipFileSystem("transform-cache", cacheFile, "")) {
 			QuiltZipPath inner = fs.getRoot();
 			if (!FasterFiles.isRegularFile(inner.resolve(FILE_TRANSFORM_COMPLETE))) {
 				Log.info(LogCategory.CACHE, "Not reusing previous transform cache since it's incomplete!");
@@ -154,8 +177,11 @@ public class TransformCache {
 						String key = diff.getKey();
 						String oldValue = diff.getValue();
 						String newValue = options.get(key);
-						Log.info(LogCategory.CACHE, "  Different: '" + key + "': '" + oldValue + "' -> '" + newValue + "'");
+						Log.info(
+							LogCategory.CACHE, "  Different: '" + key + "': '" + oldValue + "' -> '" + newValue + "'"
+						);
 					}
+					erasePreviousTransformCache(transformCacheFolder, cacheFile, null);
 					return null;
 				}
 			}
@@ -164,40 +190,60 @@ public class TransformCache {
 			if (io instanceof PartiallyWrittenIOException) {
 				Log.info(LogCategory.CACHE, "Not reusing previous transform cache since it's incomplete!");
 			} else {
-				Log.info(LogCategory.CACHE, "Not reusing previous transform cache since something went wrong while reading it!");
-			}
-			try {
-				Files.delete(transformCacheFile);
-			} catch (IOException e) {
-				ModResolutionException ex = new ModResolutionException(
-					"Failed to read an older transform cache file " + transformCacheFile + " and then delete it!", e
+				Log.info(
+					LogCategory.CACHE,
+					"Not reusing previous transform cache since something went wrong while reading it!"
 				);
-				ex.addSuppressed(io);
-				throw ex;
 			}
+
+			erasePreviousTransformCache(transformCacheFolder, cacheFile, io);
+
 			return null;
+		}
+	}
+
+	private static void erasePreviousTransformCache(Path transformCacheFolder, Path cacheFile, Throwable suppressed)
+		throws ModResolutionException {
+
+		if (!Files.exists(transformCacheFolder)) {
+			return;
+		}
+
+		try {
+			Files.walkFileTree(transformCacheFolder, Collections.emptySet(), 1, new SimpleFileVisitor<Path>() {
+				@Override
+				public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+					Files.delete(file);
+					return FileVisitResult.CONTINUE;
+				}
+			});
+		} catch (IOException e) {
+			ModResolutionException ex = new ModResolutionException(
+				"Failed to read an older transform cache file " + cacheFile + " and then delete it!", e
+			);
+			if (suppressed != null) {
+				ex.addSuppressed(suppressed);
+			}
+			throw ex;
 		}
 	}
 
 	static final boolean WRITE_CUSTOM = true;
 
-	private static QuiltZipPath createTransformCache(Path transformCacheFile, String options, List<ModLoadOption> modList,
-		ModSolveResult result) throws ModResolutionException {
+	private static QuiltZipPath createTransformCache(Path transformCacheFile, String options, List<
+		ModLoadOption> modList, ModSolveResult result) throws ModResolutionException {
 
-		if (FasterFiles.exists(transformCacheFile)) {
-			try {
-				Files.delete(transformCacheFile);
-			} catch (IOException e) {
-				throw new ModResolutionException("Failed to delete the previous transform bundle!", e);
-			}
+		try {
+			Files.createDirectories(transformCacheFile.getParent());
+		} catch (IOException e) {
+			throw new ModResolutionException("Failed to create the transform cache parent directory!", e);
 		}
 
 		if (!Boolean.getBoolean(SystemProperties.DISABLE_OPTIMIZED_COMPRESSED_TRANSFORM_CACHE)) {
 			try (QuiltMemoryFileSystem.ReadWrite rw = new QuiltMemoryFileSystem.ReadWrite("transform-cache", true)) {
 				QuiltMemoryPath root = rw.getRoot();
-				Files.write(root.resolve("options.txt"), options.getBytes(StandardCharsets.UTF_8));
 				populateTransformCache(root, modList, result);
-				// This isn't actually necessary
+				Files.write(root.resolve("options.txt"), options.getBytes(StandardCharsets.UTF_8));
 				Files.createFile(root.resolve(FILE_TRANSFORM_COMPLETE));
 				QuiltZipFileSystem.writeQuiltCompressedFileSystem(root, transformCacheFile);
 
@@ -229,18 +275,105 @@ public class TransformCache {
 
 	private static QuiltZipPath openCache(Path transformCacheFile) throws ModResolutionException {
 		try {
-			return new QuiltZipFileSystem("transform-cache", transformCacheFile, "").getRoot();
+			QuiltZipPath path = new QuiltZipFileSystem("transform-cache", transformCacheFile, "").getRoot();
+			return path;
 		} catch (IOException e) {
 			// TODO: Better error message for the gui!
 			throw new ModResolutionException("Failed to read the newly written transform cache!", e);
 		}
 	}
 
-	private static void populateTransformCache(Path root, List<ModLoadOption> modList, ModSolveResult result)
-		throws ModResolutionException {
+	private static void populateTransformCache(Path root, List<ModLoadOption> modList, ModSolveResult solveResult)
+		throws ModResolutionException, IOException {
+
 		RuntimeModRemapper.remap(root, modList);
+
 		if (Boolean.getBoolean(SystemProperties.ENABLE_EXPERIMENTAL_CHASM)) {
-			ChasmInvoker.applyChasm(root, modList, result);
+			ChasmInvoker.applyChasm(root, modList, solveResult);
 		}
+
+		InternalsHiderTransform internalsHider = new InternalsHiderTransform();
+		Map<Path, ClassData> classes = new HashMap<>();
+
+		forEachClassFile(root, modList, (mod, file) -> {
+			byte[] classBytes = Files.readAllBytes(file);
+			classes.put(file, new ClassData(mod, classBytes));
+			internalsHider.scanClass(mod, file, classBytes);
+			return null;
+		});
+
+		for (Map.Entry<Path, ClassData> entry : classes.entrySet()) {
+			byte[] newBytes = internalsHider.run(entry.getValue().mod, entry.getValue().classBytes);
+			if (newBytes != null) {
+				Files.write(entry.getKey(), newBytes);
+			}
+		}
+
+		internalsHider.finish();
+	}
+
+	private static void forEachClassFile(Path root, List<ModLoadOption> modList, ClassConsumer action)
+		throws IOException {
+		for (ModLoadOption mod : modList) {
+			visitFolder(mod, root.resolve(mod.id()), action);
+		}
+		visitFolder(null, root.resolve(TRANSFORM_CACHE_NONMOD_CLASSLOADABLE), action);
+	}
+
+	private static void visitFolder(ModLoadOption mod, Path root, ClassConsumer action) throws IOException {
+		if (!Files.isDirectory(root)) {
+			return;
+		}
+		Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
+
+			@Override
+			public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+				String folderName = Objects.toString(dir.getFileName());
+				if (folderName != null && !couldBeJavaElement(folderName, false)) {
+					return FileVisitResult.SKIP_SUBTREE;
+				}
+				return FileVisitResult.CONTINUE;
+			}
+
+			@Override
+			public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+				String fileName = file.getFileName().toString();
+				if (fileName.endsWith(".class") && couldBeJavaElement(fileName, true)) {
+					byte[] result = action.run(mod, file);
+					if (result != null) {
+						Files.write(file, result);
+					}
+				}
+				return FileVisitResult.CONTINUE;
+			}
+
+			private boolean couldBeJavaElement(String name, boolean ignoreClassSuffix) {
+				int end = name.length();
+				if (ignoreClassSuffix) {
+					end -= ".class".length();
+				}
+				for (int i = 0; i < end; i++) {
+					if (name.charAt(i) == '.') {
+						return false;
+					}
+				}
+				return true;
+			}
+		});
+	}
+
+	static final class ClassData {
+		final ModLoadOption mod;
+		final byte[] classBytes;
+
+		ClassData(ModLoadOption mod, byte[] classBytes) {
+			this.mod = mod;
+			this.classBytes = classBytes;
+		}
+	}
+
+	@FunctionalInterface
+	interface ClassConsumer {
+		byte[] run(ModLoadOption mod, Path file) throws IOException;
 	}
 }
